@@ -204,7 +204,7 @@ This project demonstrates:
 ## 👨‍💻 Author
 
 * Architha Ojha
-* GitHub: https://github.com/your-username
+* GitHub: https://github.com/ARCHITHAOJHA/CustomerChurnPredictor.git
 
 ---
 
