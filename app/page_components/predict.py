@@ -18,6 +18,69 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 MODELS_DIR = BASE_DIR / "models"
 
 
+class FallbackChurnModel:
+    """Lightweight predictor used when scikit-learn is unavailable."""
+
+    def __init__(self, bias=0.0, contract_weight=0.0, tenure_weight=0.0, monthly_weight=0.0):
+        self.bias = bias
+        self.contract_weight = contract_weight
+        self.tenure_weight = tenure_weight
+        self.monthly_weight = monthly_weight
+
+    def _score_row(self, row):
+        risk = 0.12 + self.bias
+
+        contract = str(row.get("Contract", ""))
+        if contract == "Month-to-month":
+            risk += 0.22 + self.contract_weight
+        elif contract == "Two year":
+            risk -= 0.12 - self.contract_weight
+
+        tenure = float(row.get("tenure", 0) or 0)
+        if tenure < 12:
+            risk += 0.18 + self.tenure_weight
+        elif tenure > 36:
+            risk -= 0.05
+
+        monthly_charges = float(row.get("MonthlyCharges", 0) or 0)
+        if monthly_charges > 85:
+            risk += 0.08 + self.monthly_weight
+
+        if str(row.get("InternetService", "")) == "Fiber optic":
+            risk += 0.06
+        if str(row.get("TechSupport", "")) == "No":
+            risk += 0.06
+        if str(row.get("OnlineSecurity", "")) == "No":
+            risk += 0.05
+        if str(row.get("Partner", "")) == "Yes":
+            risk -= 0.04
+        if str(row.get("Dependents", "")) == "Yes":
+            risk -= 0.04
+
+        return max(0.02, min(0.95, risk))
+
+    def predict_proba(self, data):
+        if not isinstance(data, pd.DataFrame):
+            data = pd.DataFrame(data)
+
+        probs = []
+        for _, row in data.iterrows():
+            churn_prob = self._score_row(row)
+            probs.append([1 - churn_prob, churn_prob])
+
+        return pd.DataFrame(probs).to_numpy()
+
+
+class FallbackModelBundle:
+    """Minimal bundle that mimics a pipeline for the UI."""
+
+    def __init__(self, model):
+        self.named_steps = {"model": model}
+
+    def predict_proba(self, data):
+        return self.named_steps["model"].predict_proba(data)
+
+
 def safe_load_model(filename):
     path = MODELS_DIR / filename
     if not path.exists():
@@ -54,7 +117,22 @@ def create_compatible_demo_models():
         from sklearn.preprocessing import OneHotEncoder
         from joblib import dump as _jl_dump
     except Exception as e:
-        return False, f"Required ML packages are not available: {e}"
+        try:
+            from joblib import dump as _jl_dump
+
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            model_variants = {
+                "logistic_model.pkl": FallbackModelBundle(FallbackChurnModel(bias=0.00, contract_weight=0.00, tenure_weight=0.00, monthly_weight=0.00)),
+                "rf_model.pkl": FallbackModelBundle(FallbackChurnModel(bias=0.03, contract_weight=0.02, tenure_weight=-0.01, monthly_weight=0.01)),
+                "xgb_model.pkl": FallbackModelBundle(FallbackChurnModel(bias=0.01, contract_weight=0.01, tenure_weight=0.01, monthly_weight=0.02)),
+            }
+
+            for filename, model in model_variants.items():
+                _jl_dump(model, MODELS_DIR / filename)
+
+            return True, "Fallback demo models created"
+        except Exception as fallback_error:
+            return False, f"Required ML packages are not available: {e}. Fallback setup also failed: {fallback_error}"
 
     try:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -254,10 +332,10 @@ def render_prediction_page():
 
         data = pd.DataFrame({
             "gender": [gender],
-            "SeniorCitizen": [senior],
+            "SeniorCitizen": [int(senior)],
             "Partner": [partner],
             "Dependents": [dependents],
-            "tenure": [tenure],
+            "tenure": [int(tenure)],
             "PhoneService": [phoneservice],
             "MultipleLines": [multiplelines],
             "InternetService": [internet],
@@ -270,9 +348,13 @@ def render_prediction_page():
             "Contract": [contract],
             "PaperlessBilling": [paperless],
             "PaymentMethod": [payment],
-            "MonthlyCharges": [monthly],
-            "TotalCharges": [total],
+            "MonthlyCharges": [float(monthly)],
+            "TotalCharges": [float(total)],
         })
+        
+        # Convert string columns to object dtype (fix for pandas StringDtype incompatibility)
+        for col in data.select_dtypes(include=['string']).columns:
+            data[col] = data[col].astype('object')
 
         if model_choice == "Random Forest":
             model = rf_model
@@ -284,20 +366,11 @@ def render_prediction_page():
         if model is None:
             st.error("Selected model is not available. Choose another model or add the model file.")
         else:
+            prob = None
             try:
                 prob = model.predict_proba(data)[0][1]
-            except Exception:
-                try:
-                    preprocessor = getattr(rf_model, "named_steps", {}).get("preprocessor") if rf_model else None
-                    if preprocessor is not None:
-                        X = preprocessor.transform(data)
-                        prob = model.predict_proba(X)[0][1]
-                    else:
-                        st.error("Model requires preprocessed input but preprocessor not found.")
-                        prob = None
-                except Exception:
-                    st.error("Prediction failed — model input mismatch.")
-                    prob = None
+            except Exception as e:
+                st.error(f"Prediction failed — {str(e)}")
 
             if prob is not None:
                 colA, colB = st.columns([2, 1])
